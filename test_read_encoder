@@ -1,0 +1,426 @@
+#include "stm32f401xe.h"
+
+/* ===================== KHAI BAO HAM ===================== */
+
+void Encoder_Left_TIM2_Init(void);
+void Encoder_Right_TIM4_Init(void);
+void TIM5_10ms_Init(void);
+void delay_ms(int ms);
+
+/* ===================== THONG SO ENCODER ===================== */
+
+/*
+ * Sua gia tri nay theo encoder GA25 cua ban.
+ * Vi du:
+ * Encoder 11 xung/vong motor
+ * Hop so 1:30
+ * Doc quadrature x4
+ * => PPR = 11 * 30 * 4 = 1320
+ */
+#define ENCODER_PPR     1320.0f
+#define SAMPLE_TIME     0.01f       // 10 ms
+
+/* ===================== BIEN CHO SWV ===================== */
+
+/*
+ * Cac bien global volatile de xem trong SWV Data Trace.
+ */
+volatile int g_left_count = 0;
+volatile int g_right_count = 0;
+
+volatile int g_left_delta = 0;
+volatile int g_right_delta = 0;
+
+volatile int g_left_dir = 0;
+volatile int g_right_dir = 0;
+
+/*
+ * De tranh SWV kho hien thi float, ta nhan RPM len 10 lan.
+ * Vi du g_left_rpm_x10 = 1234 nghia la RPM = 123.4
+ */
+volatile int g_left_rpm_x10 = 0;
+volatile int g_right_rpm_x10 = 0;
+
+volatile int g_speed_error_x10 = 0;
+
+volatile int g_sample_flag = 0;
+
+/* ===================== BIEN NOI BO ===================== */
+
+int left_count_now = 0;
+int left_count_old = 0;
+int left_delta = 0;
+
+int right_count_now = 0;
+int right_count_old = 0;
+int right_delta = 0;
+
+float left_rpm = 0;
+float right_rpm = 0;
+
+float left_rpm_filter = 0;
+float right_rpm_filter = 0;
+
+/* ===================== MAIN ===================== */
+
+int main(void)
+{
+    Encoder_Left_TIM2_Init();
+    Encoder_Right_TIM4_Init();
+    TIM5_10ms_Init();
+
+    while (1)
+    {
+        if (g_sample_flag == 1)
+        {
+            g_sample_flag = 0;
+
+            /*
+             * Doc gia tri hien tai cua bo dem encoder.
+             */
+            left_count_now = (int16_t)TIM2->CNT;
+            right_count_now = (int16_t)TIM4->CNT;
+
+            /*
+             * Tinh do thay doi xung sau 10 ms.
+             */
+            left_delta = left_count_now - left_count_old;
+            right_delta = right_count_now - right_count_old;
+
+            /*
+             * Luu lai gia tri cu cho lan lay mau tiep theo.
+             */
+            left_count_old = left_count_now;
+            right_count_old = right_count_now;
+
+            /*
+             * Xac dinh chieu quay.
+             * delta > 0: quay thuan
+             * delta < 0: quay nguoc
+             * delta = 0: dung yen
+             */
+            if (left_delta > 0)
+            {
+                g_left_dir = 1;
+            }
+            else if (left_delta < 0)
+            {
+                g_left_dir = -1;
+            }
+            else
+            {
+                g_left_dir = 0;
+            }
+
+            if (right_delta > 0)
+            {
+                g_right_dir = 1;
+            }
+            else if (right_delta < 0)
+            {
+                g_right_dir = -1;
+            }
+            else
+            {
+                g_right_dir = 0;
+            }
+
+            /*
+             * Tinh RPM.
+             *
+             * RPM = delta_count * 60 / (PPR * Ts)
+             */
+            left_rpm = ((float)left_delta * 60.0f) / (ENCODER_PPR * SAMPLE_TIME);
+            right_rpm = ((float)right_delta * 60.0f) / (ENCODER_PPR * SAMPLE_TIME);
+
+            /*
+             * Loc mem toc do de do thi bot giat.
+             */
+            left_rpm_filter = 0.7f * left_rpm_filter + 0.3f * left_rpm;
+            right_rpm_filter = 0.7f * right_rpm_filter + 0.3f * right_rpm;
+
+            /*
+             * Cap nhat bien SWV.
+             */
+            g_left_count = left_count_now;
+            g_right_count = right_count_now;
+
+            g_left_delta = left_delta;
+            g_right_delta = right_delta;
+
+            g_left_rpm_x10 = (int)(left_rpm_filter * 10.0f);
+            g_right_rpm_x10 = (int)(right_rpm_filter * 10.0f);
+
+            g_speed_error_x10 = g_left_rpm_x10 - g_right_rpm_x10;
+        }
+    }
+}
+
+void Encoder_Left_TIM2_Init(void)
+{
+    /*
+     * Encoder trai:
+     * PA0 -> TIM2_CH1
+     * PA1 -> TIM2_CH2
+     */
+
+    /*
+     * Bat clock GPIOA.
+     */
+    RCC->AHB1ENR |= (1 << 0);
+
+    /*
+     * Bat clock TIM2.
+     * TIM2 nam tren APB1.
+     * Bit 0 trong RCC->APB1ENR la TIM2EN.
+     */
+    RCC->APB1ENR |= (1 << 0);
+
+    /*
+     * PA0, PA1 chuyen sang Alternate Function.
+     * MODER = 10.
+     */
+    GPIOA->MODER &= ~((3 << (0 * 2)) |
+                      (3 << (1 * 2)));
+
+    GPIOA->MODER |=  ((2 << (0 * 2)) |
+                      (2 << (1 * 2)));
+
+    /*
+     * PA0, PA1 dung AF1 cho TIM2.
+     * Moi chan dung 4 bit trong AFR[0].
+     */
+    GPIOA->AFR[0] &= ~((15 << (0 * 4)) |
+                       (15 << (1 * 4)));
+
+    GPIOA->AFR[0] |=  ((1 << (0 * 4)) |
+                       (1 << (1 * 4)));
+
+    /*
+     * Bat pull-up noi cho PA0, PA1.
+     * PUPDR = 01.
+     */
+    GPIOA->PUPDR &= ~((3 << (0 * 2)) |
+                      (3 << (1 * 2)));
+
+    GPIOA->PUPDR |=  ((1 << (0 * 2)) |
+                      (1 << (1 * 2)));
+
+    /*
+     * Reset cac thanh ghi chinh cua TIM2.
+     */
+    TIM2->CR1 = 0;
+    TIM2->SMCR = 0;
+    TIM2->CCMR1 = 0;
+    TIM2->CCER = 0;
+
+    /*
+     * Encoder mode 3.
+     * SMS[2:0] = 011.
+     * Timer se dem dua tren ca TI1 va TI2.
+     */
+    TIM2->SMCR |= (3 << 0);
+
+    /*
+     * Cau hinh CH1 va CH2 la input.
+     *
+     * CC1S[1:0] = 01: CC1 mapped to TI1
+     * CC2S[1:0] = 01: CC2 mapped to TI2
+     */
+    TIM2->CCMR1 |= (1 << 0);    // CC1S = 01
+    TIM2->CCMR1 |= (1 << 8);    // CC2S = 01
+
+    /*
+     * Input filter de giam nhieu xung ngan.
+     *
+     * IC1F nam o bit 7:4
+     * IC2F nam o bit 15:12
+     *
+     * Gia tri 0011 la muc loc nhe.
+     */
+    TIM2->CCMR1 |= (3 << 4);
+    TIM2->CCMR1 |= (3 << 12);
+
+    /*
+     * Khong dao cuc tinh tin hieu.
+     * CC1P = 0, CC2P = 0.
+     */
+    TIM2->CCER &= ~(1 << 1);
+    TIM2->CCER &= ~(1 << 5);
+
+    /*
+     * Gioi han bo dem 16-bit de tinh delta de hon.
+     */
+    TIM2->ARR = 0xFFFF;
+    TIM2->CNT = 0;
+
+    /*
+     * Bat counter.
+     */
+    TIM2->CR1 |= (1 << 0);
+}
+
+void Encoder_Right_TIM4_Init(void)
+{
+    /*
+     * Encoder phai:
+     * PB6 -> TIM4_CH1
+     * PB7 -> TIM4_CH2
+     */
+
+    /*
+     * Bat clock GPIOB.
+     */
+    RCC->AHB1ENR |= (1 << 1);
+
+    /*
+     * Bat clock TIM4.
+     * TIM4 nam tren APB1.
+     * Bit 2 trong RCC->APB1ENR la TIM4EN.
+     */
+    RCC->APB1ENR |= (1 << 2);
+
+    /*
+     * PB6, PB7 chuyen sang Alternate Function.
+     */
+    GPIOB->MODER &= ~((3 << (6 * 2)) |
+                      (3 << (7 * 2)));
+
+    GPIOB->MODER |=  ((2 << (6 * 2)) |
+                      (2 << (7 * 2)));
+
+    /*
+     * PB6, PB7 dung AF2 cho TIM4.
+     */
+    GPIOB->AFR[0] &= ~((15 << (6 * 4)) |
+                       (15 << (7 * 4)));
+
+    GPIOB->AFR[0] |=  ((2 << (6 * 4)) |
+                       (2 << (7 * 4)));
+
+    /*
+     * Bat pull-up cho PB6, PB7.
+     */
+    GPIOB->PUPDR &= ~((3 << (6 * 2)) |
+                      (3 << (7 * 2)));
+
+    GPIOB->PUPDR |=  ((1 << (6 * 2)) |
+                      (1 << (7 * 2)));
+
+    /*
+     * Reset cac thanh ghi chinh cua TIM4.
+     */
+    TIM4->CR1 = 0;
+    TIM4->SMCR = 0;
+    TIM4->CCMR1 = 0;
+    TIM4->CCER = 0;
+
+    /*
+     * Encoder mode 3.
+     */
+    TIM4->SMCR |= (3 << 0);
+
+    /*
+     * CH1 va CH2 la input.
+     */
+    TIM4->CCMR1 |= (1 << 0);    // CC1S = 01
+    TIM4->CCMR1 |= (1 << 8);    // CC2S = 01
+
+    /*
+     * Input filter.
+     */
+    TIM4->CCMR1 |= (3 << 4);
+    TIM4->CCMR1 |= (3 << 12);
+
+    /*
+     * Khong dao cuc tinh.
+     */
+    TIM4->CCER &= ~(1 << 1);
+    TIM4->CCER &= ~(1 << 5);
+
+    TIM4->ARR = 0xFFFF;
+    TIM4->CNT = 0;
+
+    /*
+     * Bat counter.
+     */
+    TIM4->CR1 |= (1 << 0);
+}
+
+void TIM5_10ms_Init(void)
+{
+    /*
+     * TIM5 tao ngat moi 10 ms.
+     */
+
+    /*
+     * Bat clock TIM5.
+     * TIM5 nam tren APB1.
+     * Bit 3 trong RCC->APB1ENR la TIM5EN.
+     */
+    RCC->APB1ENR |= (1 << 3);
+
+    /*
+     * Gia su clock timer = 16 MHz.
+     *
+     * PSC = 1600 - 1
+     * => timer tick = 16 MHz / 1600 = 10 kHz
+     * => moi tick = 0.1 ms
+     */
+    TIM5->PSC = 1600 - 1;
+
+    /*
+     * ARR = 100 - 1
+     * => 100 tick * 0.1 ms = 10 ms
+     */
+    TIM5->ARR = 100 - 1;
+
+    TIM5->CNT = 0;
+
+    /*
+     * Cho phep ngat update.
+     * UIE la bit 0 trong DIER.
+     */
+    TIM5->DIER |= (1 << 0);
+
+    /*
+     * Bat ngat TIM5 trong NVIC.
+     */
+    NVIC_EnableIRQ(TIM5_IRQn);
+
+    /*
+     * Bat timer.
+     */
+    TIM5->CR1 |= (1 << 0);
+}
+
+void TIM5_IRQHandler(void)
+{
+    /*
+     * Kiem tra co update interrupt.
+     * UIF la bit 0 trong SR.
+     */
+    if (TIM5->SR & (1 << 0))
+    {
+        /*
+         * Xoa co ngat.
+         */
+        TIM5->SR &= ~(1 << 0);
+
+        /*
+         * Bao cho vong while biet da den chu ky lay mau.
+         */
+        g_sample_flag = 1;
+    }
+}
+
+void delay_ms(int ms)
+{
+    for (int i = 0; i < ms; i++)
+    {
+        for (int j = 0; j < 1600; j++)
+        {
+            __NOP();
+        }
+    }
+}
