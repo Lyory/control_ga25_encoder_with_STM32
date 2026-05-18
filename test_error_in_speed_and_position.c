@@ -3,7 +3,10 @@
 
 /* ================= BIEN XEM TREN SWV ================= */
 
-volatile int g_pwm = 0;
+volatile int g_pwm_base = 500;
+volatile int g_pwm_left = 0;
+volatile int g_pwm_right = 0;
+volatile int g_pwm_comp = 0;
 
 volatile int g_left_count = 0;
 volatile int g_right_count = 0;
@@ -14,37 +17,65 @@ volatile int g_right_delta = 0;
 volatile int g_left_rpm_x10 = 0;
 volatile int g_right_rpm_x10 = 0;
 
-volatile int g_speed_error_x10 = 0;
+volatile int g_speed_error = 0;
 volatile int g_position_error = 0;
+volatile int g_total_error = 0;
+
+volatile int g_sample_count = 0;
 
 /* ================= THONG SO ================= */
 
-/*
- * Sau khi test:
- * - Banh trai quay tien nhung count giam -> left_sign = -1
- * - Banh phai quay tien nhung RPM ban dau bi am -> right_sign = -1
- *
- * Muc tieu:
- * Khi xe chay tien:
- * g_left_rpm_x10 > 0
- * g_right_rpm_x10 > 0
- */
-int left_sign = -1;
-int right_sign = -1;
+#define ENCODER_PPR       1320
+#define DELTA_LIMIT       300
+
+#define PWM_MIN           0
+#define PWM_MAX           999
 
 /*
- * Encoder GA25:
- * Vi du: 11 PPR, hop so 1:30, doc quadrature x4
- * PPR = 11 * 30 * 4 = 1320
- */
-int encoder_ppr = 1320;
+    PWM co dinh de tuning.
+    Khong quet PWM trong giai doan toi uu.
+*/
+#define PWM_BASE          500
 
 /*
- * Gioi han delta bat thuong.
- * Neu trong 10 ms ma delta vuot qua nguong nay
- * thi xem nhu xung loi/nhieu.
- */
-int delta_limit = 300;
+    Tham so bu PWM.
+
+    KP_POS: sua sai so vi tri tich luy
+    KP_SPEED: sua sai so toc do tuc thoi
+
+    Neu position_error van tang nhanh:
+    - tang KP_POS
+    - hoac giam POSITION_DIV
+
+    Neu PWM dao dong manh:
+    - giam KP_SPEED
+    - tang POSITION_DIV
+*/
+#define KP_POS            1
+#define POSITION_DIV      20
+
+#define KP_SPEED          3
+
+#define PWM_COMP_LIMIT    300
+
+/*
+    Chinh dau encoder.
+    Khi xe chay tien:
+    g_left_delta va g_right_delta phai duong.
+*/
+int left_sign = 1;
+int right_sign = 1;
+
+/* ================= BIEN NOI BO ================= */
+
+volatile uint16_t left_now = 0;
+volatile uint16_t left_old = 0;
+
+volatile uint16_t right_now = 0;
+volatile uint16_t right_old = 0;
+
+volatile int left_total = 0;
+volatile int right_total = 0;
 
 /* ================= KHAI BAO HAM ================= */
 
@@ -55,8 +86,10 @@ void Encoder_TIM4_Init(void);
 void TIM5_10ms_Init(void);
 
 void Motor_Forward(void);
-void Motor_SetPWM(int pwm);
+void Motor_SetPWM_Separate(int pwm_left, int pwm_right);
 void Motor_Stop(void);
+
+int limit_value(int value, int min, int max);
 
 /* ================= MAIN ================= */
 
@@ -72,140 +105,22 @@ int main(void)
 
     Motor_Forward();
 
-    uint16_t left_now = 0;
-    uint16_t left_old = 0;
-
-    uint16_t right_now = 0;
-    uint16_t right_old = 0;
-
-    int left_total = 0;
-    int right_total = 0;
-
-    int sample_count = 0;
+    g_pwm_base = PWM_BASE;
+    Motor_SetPWM_Separate(g_pwm_base, g_pwm_base);
 
     while (1)
     {
         /*
-         * Polling TIM5.
-         * Moi khi TIM5 tran -> duoc 10 ms.
-         * UIF la bit 0 cua TIM5->SR.
-         */
-        if (TIM5->SR & (1 << 0))
-        {
-            /*
-             * Xoa co tran UIF.
-             */
-            TIM5->SR &= ~(1 << 0);
-
-            /*
-             * Quet PWM moi 5 giay.
-             * 1 lan lay mau = 10 ms
-             * 500 lan = 5 giay
-             */
-            sample_count++;
-
-            if (sample_count < 5000)
-            {
-                Motor_SetPWM(500);
-            }
-//            else if (sample_count < 1000)
-//            {
-//                Motor_SetPWM(400);
-//            }
-//            else if (sample_count < 1500)
-//            {
-//                Motor_SetPWM(500);
-//            }
-//            else if (sample_count < 2000)
-//            {
-//                Motor_SetPWM(600);
-//            }
-//            else if (sample_count < 2500)
-//            {
-//                Motor_SetPWM(700);
-//            }
-            else
-            {
-                sample_count = 0;
-
-                /*
-                 * Reset tong xung de de quan sat lai position_error.
-                 */
-                left_total = 0;
-                right_total = 0;
-            }
-
-            /* ========== DOC ENCODER ========== */
-
-            /*
-             * Doc truc tiep CNT dang unsigned 16-bit.
-             */
-            left_now = TIM2->CNT;
-            right_now = TIM4->CNT;
-
-            /*
-             * Tinh delta co xu ly tran timer.
-             *
-             * Vi TIM2/TIM4 dang ARR = 0xFFFF,
-             * phep tru uint16_t sau do ep ve int16_t se xu ly duoc tran:
-             * 65535 -> 0 hoac 0 -> 65535.
-             */
-            g_left_delta = left_sign * (int16_t)(left_now - left_old);
-            g_right_delta = right_sign * (int16_t)(right_now - right_old);
-
-            left_old = left_now;
-            right_old = right_now;
-
-            /*
-             * Loc delta bat thuong.
-             * Neu gia tri qua lon thi gan ve 0 de tranh RPM nhay vot.
-             */
-            if (g_left_delta > delta_limit || g_left_delta < -delta_limit)
-            {
-                g_left_delta = 0;
-            }
-
-            if (g_right_delta > delta_limit || g_right_delta < -delta_limit)
-            {
-                g_right_delta = 0;
-            }
-
-            /*
-             * Tinh tong xung.
-             */
-            left_total += g_left_delta;
-            right_total += g_right_delta;
-
-            g_left_count = left_total;
-            g_right_count = right_total;
-
-            /*
-             * Tinh RPM x10.
-             *
-             * Ts = 10 ms = 0.01 s
-             *
-             * RPM = delta * 60 / (PPR * 0.01)
-             * RPM = delta * 6000 / PPR
-             *
-             * RPM x10 = delta * 60000 / PPR
-             */
-            g_left_rpm_x10 = g_left_delta * 60000 / encoder_ppr;
-            g_right_rpm_x10 = g_right_delta * 60000 / encoder_ppr;
-
-            /*
-             * Sai lech toc do.
-             * > 0: banh trai nhanh hon
-             * < 0: banh phai nhanh hon
-             */
-            g_speed_error_x10 = g_left_rpm_x10 - g_right_rpm_x10;
-
-            /*
-             * Sai lech vi tri/quang duong.
-             * > 0: banh trai di nhieu xung hon
-             * < 0: banh phai di nhieu xung hon
-             */
-            g_position_error = g_left_count - g_right_count;
-        }
+            Xem tren SWV:
+            g_pwm_left
+            g_pwm_right
+            g_pwm_comp
+            g_left_delta
+            g_right_delta
+            g_speed_error
+            g_position_error
+            g_total_error
+        */
     }
 }
 
@@ -214,39 +129,27 @@ int main(void)
 void GPIO_Motor_Init(void)
 {
     /*
-     * PA6 = TIM3_CH1 = ENA
-     * PA7 = TIM3_CH2 = ENB
-     *
-     * PC0 = IN1
-     * PC1 = IN2
-     * PC2 = IN3
-     * PC3 = IN4
-     */
+        PA6 = TIM3_CH1 = PWM banh trai
+        PA7 = TIM3_CH2 = PWM banh phai
+
+        PC0 = IN1
+        PC1 = IN2
+        PC2 = IN3
+        PC3 = IN4
+    */
 
     RCC->AHB1ENR |= (1 << 0);   // GPIOA clock
     RCC->AHB1ENR |= (1 << 2);   // GPIOC clock
 
-    /*
-     * PC0, PC1, PC2, PC3 output.
-     * MODER = 01.
-     */
+    // PC0, PC1, PC2, PC3 output
     GPIOC->MODER &= ~((3 << 0) | (3 << 2) | (3 << 4) | (3 << 6));
     GPIOC->MODER |=  ((1 << 0) | (1 << 2) | (1 << 4) | (1 << 6));
 
-    /*
-     * PA6, PA7 alternate function.
-     * MODER = 10.
-     */
+    // PA6, PA7 alternate function
     GPIOA->MODER &= ~((3 << 12) | (3 << 14));
     GPIOA->MODER |=  ((2 << 12) | (2 << 14));
 
-    /*
-     * GPIOA_AFRL:
-     * PA6 nam trong AFRL bit 27:24.
-     * PA7 nam trong AFRL bit 31:28.
-     *
-     * AF2 = TIM3.
-     */
+    // PA6, PA7 = AF2 = TIM3
     GPIOA->AFR[0] &= ~((15 << 24) | (15 << 28));
     GPIOA->AFR[0] |=  ((2 << 24) | (2 << 28));
 }
@@ -255,45 +158,37 @@ void GPIO_Motor_Init(void)
 
 void TIM3_PWM_Init(void)
 {
-    /*
-     * TIM3 nam tren APB1.
-     */
     RCC->APB1ENR |= (1 << 1);   // TIM3 clock
 
     /*
-     * Clock = 16 MHz
-     * PSC = 16 - 1 -> timer dem 1 MHz
-     * ARR = 1000 - 1 -> PWM = 1 kHz
-     */
+        Clock = 16 MHz
+        PSC = 16 - 1      -> timer tick = 1 MHz
+        ARR = 1000 - 1    -> PWM = 1 kHz
+    */
     TIM3->PSC = 16 - 1;
     TIM3->ARR = 1000 - 1;
 
     TIM3->CCR1 = 0;
     TIM3->CCR2 = 0;
 
-    /*
-     * CH1 PWM mode 1.
-     * OC1M = 110 tai bit 6:4.
-     */
-    TIM3->CCMR1 &= ~(7 << 4);
-    TIM3->CCMR1 |=  (6 << 4);
+    // CH1, CH2 PWM mode 1
+    TIM3->CCMR1 &= ~((7 << 4) | (7 << 12));
+    TIM3->CCMR1 |=  ((6 << 4) | (6 << 12));
 
-    /*
-     * CH2 PWM mode 1.
-     * OC2M = 110 tai bit 14:12.
-     */
-    TIM3->CCMR1 &= ~(7 << 12);
-    TIM3->CCMR1 |=  (6 << 12);
+    // Preload CCR1, CCR2
+    TIM3->CCMR1 |= (1 << 3);    // OC1PE
+    TIM3->CCMR1 |= (1 << 11);   // OC2PE
 
-    /*
-     * Enable output CH1 va CH2.
-     */
-    TIM3->CCER |= (1 << 0);     // CC1E
-    TIM3->CCER |= (1 << 4);     // CC2E
+    // Enable output CH1, CH2
+    TIM3->CCER |= (1 << 0) | (1 << 4);
 
-    /*
-     * Bat timer.
-     */
+    // Auto-reload preload
+    TIM3->CR1 |= (1 << 7);      // ARPE
+
+    // Update event
+    TIM3->EGR |= (1 << 0);
+
+    // Bat timer
     TIM3->CR1 |= (1 << 0);      // CEN
 }
 
@@ -301,153 +196,199 @@ void TIM3_PWM_Init(void)
 
 void Encoder_TIM2_Init(void)
 {
-    /*
-     * Encoder trai:
-     * PA0 = TIM2_CH1
-     * PA1 = TIM2_CH2
-     */
-
     RCC->AHB1ENR |= (1 << 0);   // GPIOA clock
     RCC->APB1ENR |= (1 << 0);   // TIM2 clock
 
-    /*
-     * PA0, PA1 alternate function.
-     * MODER = 10.
-     */
+    // PA0, PA1 alternate function
     GPIOA->MODER &= ~((3 << 0) | (3 << 2));
     GPIOA->MODER |=  ((2 << 0) | (2 << 2));
 
-    /*
-     * GPIOA_AFRL:
-     * PA0 nam trong AFRL bit 3:0.
-     * PA1 nam trong AFRL bit 7:4.
-     *
-     * AF1 = TIM2.
-     */
+    // PA0, PA1 = AF1 = TIM2
     GPIOA->AFR[0] &= ~((15 << 0) | (15 << 4));
     GPIOA->AFR[0] |=  ((1 << 0) | (1 << 4));
 
-    /*
-     * Pull-up PA0, PA1.
-     */
+    // Pull-up PA0, PA1
     GPIOA->PUPDR &= ~((3 << 0) | (3 << 2));
     GPIOA->PUPDR |=  ((1 << 0) | (1 << 2));
 
-    /*
-     * Encoder mode 3.
-     * SMS = 011.
-     */
+    TIM2->CR1 = 0;
+    TIM2->SMCR = 0;
+    TIM2->CCMR1 = 0;
+    TIM2->CCER = 0;
+
+    // Encoder mode 3
     TIM2->SMCR |= (3 << 0);
 
-    /*
-     * CH1 input TI1, CH2 input TI2.
-     * CC1S = 01, CC2S = 01.
-     */
-    TIM2->CCMR1 |= (1 << 0);
-    TIM2->CCMR1 |= (1 << 8);
+    // CH1 input TI1, CH2 input TI2
+    TIM2->CCMR1 |= (1 << 0) | (1 << 8);
 
-    /*
-     * Input filter nhe.
-     * IC1F = 0011, IC2F = 0011.
-     */
-    TIM2->CCMR1 |= (3 << 4);
-    TIM2->CCMR1 |= (3 << 12);
+    // Input filter nhe
+    TIM2->CCMR1 |= (3 << 4) | (3 << 12);
 
     TIM2->ARR = 0xFFFF;
     TIM2->CNT = 0;
 
-    /*
-     * Bat timer.
-     */
-    TIM2->CR1 |= (1 << 0);
+    TIM2->CR1 |= (1 << 0);      // CEN
 }
 
 /* ================= ENCODER PHAI TIM4 ================= */
 
 void Encoder_TIM4_Init(void)
 {
-    /*
-     * Encoder phai:
-     * PB6 = TIM4_CH1
-     * PB7 = TIM4_CH2
-     */
-
     RCC->AHB1ENR |= (1 << 1);   // GPIOB clock
     RCC->APB1ENR |= (1 << 2);   // TIM4 clock
 
-    /*
-     * PB6, PB7 alternate function.
-     * MODER = 10.
-     */
+    // PB6, PB7 alternate function
     GPIOB->MODER &= ~((3 << 12) | (3 << 14));
     GPIOB->MODER |=  ((2 << 12) | (2 << 14));
 
-    /*
-     * GPIOB_AFRL:
-     * PB6 nam trong AFRL bit 27:24.
-     * PB7 nam trong AFRL bit 31:28.
-     *
-     * AF2 = TIM4.
-     */
+    // PB6, PB7 = AF2 = TIM4
     GPIOB->AFR[0] &= ~((15 << 24) | (15 << 28));
     GPIOB->AFR[0] |=  ((2 << 24) | (2 << 28));
 
-    /*
-     * Pull-up PB6, PB7.
-     */
+    // Pull-up PB6, PB7
     GPIOB->PUPDR &= ~((3 << 12) | (3 << 14));
     GPIOB->PUPDR |=  ((1 << 12) | (1 << 14));
 
-    /*
-     * Encoder mode 3.
-     */
+    TIM4->CR1 = 0;
+    TIM4->SMCR = 0;
+    TIM4->CCMR1 = 0;
+    TIM4->CCER = 0;
+
+    // Encoder mode 3
     TIM4->SMCR |= (3 << 0);
 
-    /*
-     * CH1 input TI1, CH2 input TI2.
-     */
-    TIM4->CCMR1 |= (1 << 0);
-    TIM4->CCMR1 |= (1 << 8);
+    // CH1 input TI1, CH2 input TI2
+    TIM4->CCMR1 |= (1 << 0) | (1 << 8);
 
-    /*
-     * Input filter nhe.
-     */
-    TIM4->CCMR1 |= (3 << 4);
-    TIM4->CCMR1 |= (3 << 12);
+    // Input filter nhe
+    TIM4->CCMR1 |= (3 << 4) | (3 << 12);
 
     TIM4->ARR = 0xFFFF;
     TIM4->CNT = 0;
 
-    /*
-     * Bat timer.
-     */
-    TIM4->CR1 |= (1 << 0);
+    TIM4->CR1 |= (1 << 0);      // CEN
 }
 
-/* ================= TIMER 10 ms ================= */
+/* ================= TIMER 5 LAY MAU 10 ms ================= */
 
 void TIM5_10ms_Init(void)
 {
-    /*
-     * TIM5 tao chu ky lay mau 10 ms bang polling UIF.
-     */
-
     RCC->APB1ENR |= (1 << 3);   // TIM5 clock
 
     /*
-     * Clock = 16 MHz
-     * PSC = 1600 - 1 -> 10 kHz
-     * ARR = 100 - 1 -> 10 ms
-     */
+        Clock = 16 MHz
+        PSC = 1600 - 1 -> 10 kHz
+        ARR = 100 - 1  -> 10 ms
+    */
     TIM5->PSC = 1600 - 1;
     TIM5->ARR = 100 - 1;
 
     TIM5->CNT = 0;
 
-    /*
-     * Bat timer.
-     */
+    // Cho phep update interrupt
+    TIM5->DIER |= (1 << 0);
+
+    // Bat ngat TIM5 trong NVIC
+    NVIC_EnableIRQ(TIM5_IRQn);
+
+    // Bat timer
     TIM5->CR1 |= (1 << 0);
+}
+
+/* ================= NGAT TIM5 MOI 10 ms ================= */
+
+void TIM5_IRQHandler(void)
+{
+    if (TIM5->SR & (1 << 0))
+    {
+        // Xoa co ngat UIF
+        TIM5->SR &= ~(1 << 0);
+
+        g_sample_count++;
+
+        /* ===== DOC ENCODER ===== */
+
+        left_now = TIM2->CNT;
+        right_now = TIM4->CNT;
+
+        /*
+            Delta trong 10 ms.
+            Ep int16_t giup xu ly tran 16-bit.
+        */
+        g_left_delta = left_sign * (int16_t)(left_now - left_old);
+        g_right_delta = right_sign * (int16_t)(right_now - right_old);
+
+        left_old = left_now;
+        right_old = right_now;
+
+        /*
+            Loc delta bat thuong.
+        */
+        if (g_left_delta > DELTA_LIMIT || g_left_delta < -DELTA_LIMIT)
+        {
+            g_left_delta = 0;
+        }
+
+        if (g_right_delta > DELTA_LIMIT || g_right_delta < -DELTA_LIMIT)
+        {
+            g_right_delta = 0;
+        }
+
+        /* ===== TINH SAI SO ===== */
+
+        left_total += g_left_delta;
+        right_total += g_right_delta;
+
+        g_left_count = left_total;
+        g_right_count = right_total;
+
+        /*
+            Speed error:
+            > 0: banh trai nhanh hon banh phai
+            < 0: banh phai nhanh hon banh trai
+        */
+        g_speed_error = g_left_delta - g_right_delta;
+
+        /*
+            Position error:
+            > 0: banh trai di nhieu xung hon
+            < 0: banh phai di nhieu xung hon
+        */
+        g_position_error = g_left_count - g_right_count;
+
+        /*
+            RPM_x10 = delta * 60000 / PPR
+        */
+        g_left_rpm_x10 = g_left_delta * 60000 / ENCODER_PPR;
+        g_right_rpm_x10 = g_right_delta * 60000 / ENCODER_PPR;
+
+        /*
+            Total error:
+            - Thanh phan position_error giup sua sai so tich luy.
+            - Thanh phan speed_error giup phan ung nhanh.
+        */
+        g_total_error = (KP_POS * (g_position_error / POSITION_DIV))
+                      + (KP_SPEED * g_speed_error);
+
+        /*
+            Gioi han bu PWM.
+        */
+        g_pwm_comp = limit_value(g_total_error, -PWM_COMP_LIMIT, PWM_COMP_LIMIT);
+
+        /*
+            Neu error > 0:
+            banh trai nhanh/di nhieu hon
+            => giam PWM trai, tang PWM phai.
+        */
+        g_pwm_left = g_pwm_base - g_pwm_comp;
+        g_pwm_right = g_pwm_base + g_pwm_comp;
+
+        g_pwm_left = limit_value(g_pwm_left, PWM_MIN, PWM_MAX);
+        g_pwm_right = limit_value(g_pwm_right, PWM_MIN, PWM_MAX);
+
+        Motor_SetPWM_Separate(g_pwm_left, g_pwm_right);
+    }
 }
 
 /* ================= MOTOR ================= */
@@ -455,12 +396,12 @@ void TIM5_10ms_Init(void)
 void Motor_Forward(void)
 {
     /*
-     * Motor trai:
-     * IN1 = 1, IN2 = 0
-     *
-     * Motor phai:
-     * IN3 = 1, IN4 = 0
-     */
+        Motor trai:
+        IN1 = 1, IN2 = 0
+
+        Motor phai:
+        IN3 = 1, IN4 = 0
+    */
 
     GPIOC->BSRR = (1 << 0);          // PC0 = 1
     GPIOC->BSRR = (1 << (1 + 16));   // PC1 = 0
@@ -469,32 +410,20 @@ void Motor_Forward(void)
     GPIOC->BSRR = (1 << (3 + 16));   // PC3 = 0
 }
 
-void Motor_SetPWM(int pwm)
+void Motor_SetPWM_Separate(int pwm_left, int pwm_right)
 {
-    if (pwm < 0)
-    {
-        pwm = 0;
-    }
+    pwm_left = limit_value(pwm_left, PWM_MIN, PWM_MAX);
+    pwm_right = limit_value(pwm_right, PWM_MIN, PWM_MAX);
 
-    if (pwm > 999)
-    {
-        pwm = 999;
-    }
+    TIM3->CCR1 = pwm_left;
+    TIM3->CCR2 = pwm_right;
 
-    /*
-     * Cung PWM cho hai banh de test sai lech tu nhien.
-     */
-    TIM3->CCR1 = pwm;
-    TIM3->CCR2 = pwm;
-
-    g_pwm = pwm;
+    g_pwm_left = pwm_left;
+    g_pwm_right = pwm_right;
 }
 
 void Motor_Stop(void)
 {
-    /*
-     * IN1 = IN2 = IN3 = IN4 = 0.
-     */
     GPIOC->BSRR = (1 << (0 + 16));
     GPIOC->BSRR = (1 << (1 + 16));
     GPIOC->BSRR = (1 << (2 + 16));
@@ -503,5 +432,23 @@ void Motor_Stop(void)
     TIM3->CCR1 = 0;
     TIM3->CCR2 = 0;
 
-    g_pwm = 0;
+    g_pwm_left = 0;
+    g_pwm_right = 0;
+}
+
+/* ================= HAM GIOI HAN ================= */
+
+int limit_value(int value, int min, int max)
+{
+    if (value < min)
+    {
+        value = min;
+    }
+
+    if (value > max)
+    {
+        value = max;
+    }
+
+    return value;
 }
