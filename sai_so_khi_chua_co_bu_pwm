@@ -17,6 +17,7 @@ volatile int g_right_rpm_x10 = 0;
 volatile int g_speed_error_x10 = 0;
 volatile int g_position_error = 0;
 
+volatile int g_sample_flag = 0;
 volatile int g_sample_count = 0;
 volatile int g_pwm_index = 0;
 
@@ -40,14 +41,14 @@ int right_sign = 1;
 
 /* ================= BIEN NOI BO ================= */
 
-volatile uint16_t left_now = 0;
-volatile uint16_t left_old = 0;
+uint16_t left_now = 0;
+uint16_t left_old = 0;
 
-volatile uint16_t right_now = 0;
-volatile uint16_t right_old = 0;
+uint16_t right_now = 0;
+uint16_t right_old = 0;
 
-volatile int left_total = 0;
-volatile int right_total = 0;
+int left_total = 0;
+int right_total = 0;
 
 /* ================= KHAI BAO HAM ================= */
 
@@ -74,8 +75,66 @@ int main(void)
     while (1)
     {
         /*
-            Tat ca viec lay mau encoder duoc lam trong TIM5_IRQHandler.
+            TIM5_IRQHandler chi dat co g_sample_flag.
+            Khi g_sample_flag = 1, main moi xu ly encoder.
         */
+        if (g_sample_flag == 1)
+        {
+            g_sample_flag = 0;
+
+            /* Doi muc PWM moi 5s */
+            g_sample_count++;
+
+            if (g_sample_count >= SAMPLE_PER_PWM)
+            {
+                g_sample_count = 0;
+
+                g_pwm_index++;
+
+                if (g_pwm_index >= PWM_LEVEL_COUNT)
+                {
+                    g_pwm_index = 0;
+                }
+
+                Motor_SetPWM(pwm_table[g_pwm_index]);
+            }
+
+            /* Doc encoder */
+            left_now = TIM2->CNT;
+            right_now = TIM4->CNT;
+
+            g_left_delta = left_sign * (int16_t)(left_now - left_old);
+            g_right_delta = right_sign * (int16_t)(right_now - right_old);
+
+            left_old = left_now;
+            right_old = right_now;
+
+            /* Loc delta bat thuong */
+            if (g_left_delta > DELTA_LIMIT || g_left_delta < -DELTA_LIMIT)
+            {
+                g_left_delta = 0;
+            }
+
+            if (g_right_delta > DELTA_LIMIT || g_right_delta < -DELTA_LIMIT)
+            {
+                g_right_delta = 0;
+            }
+
+            /* Tinh count tich luy */
+            left_total += g_left_delta;
+            right_total += g_right_delta;
+
+            g_left_count = left_total;
+            g_right_count = right_total;
+
+            /* Tinh RPM x10 */
+            g_left_rpm_x10 = g_left_delta * 60000 / ENCODER_PPR;
+            g_right_rpm_x10 = g_right_delta * 60000 / ENCODER_PPR;
+
+            /* Tinh sai so */
+            g_speed_error_x10 = g_left_rpm_x10 - g_right_rpm_x10;
+            g_position_error = g_left_count - g_right_count;
+        }
     }
 }
 
@@ -232,59 +291,7 @@ void TIM5_IRQHandler(void)
     if (TIM5->SR & (1 << 0))
     {
         TIM5->SR &= ~(1 << 0);
-
-        /* Doi muc PWM moi 5s */
-        g_sample_count++;
-
-        if (g_sample_count >= SAMPLE_PER_PWM)
-        {
-            g_sample_count = 0;
-
-            g_pwm_index++;
-
-            if (g_pwm_index >= PWM_LEVEL_COUNT)
-            {
-                g_pwm_index = 0;
-            }
-
-            Motor_SetPWM(pwm_table[g_pwm_index]);
-        }
-
-        /* Doc encoder */
-        left_now = TIM2->CNT;
-        right_now = TIM4->CNT;
-
-        g_left_delta = left_sign * (int16_t)(left_now - left_old);
-        g_right_delta = right_sign * (int16_t)(right_now - right_old);
-
-        left_old = left_now;
-        right_old = right_now;
-
-        /* Loc delta bat thuong */
-        if (g_left_delta > DELTA_LIMIT || g_left_delta < -DELTA_LIMIT)
-        {
-            g_left_delta = 0;
-        }
-
-        if (g_right_delta > DELTA_LIMIT || g_right_delta < -DELTA_LIMIT)
-        {
-            g_right_delta = 0;
-        }
-
-        /* Tinh count tich luy */
-        left_total += g_left_delta;
-        right_total += g_right_delta;
-
-        g_left_count = left_total;
-        g_right_count = right_total;
-
-        /* Tinh RPM x10 */
-        g_left_rpm_x10 = g_left_delta * 60000 / ENCODER_PPR;
-        g_right_rpm_x10 = g_right_delta * 60000 / ENCODER_PPR;
-
-        /* Tinh sai so */
-        g_speed_error_x10 = g_left_rpm_x10 - g_right_rpm_x10;
-        g_position_error = g_left_count - g_right_count;
+        g_sample_flag = 1;
     }
 }
 
