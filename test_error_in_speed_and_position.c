@@ -19,7 +19,11 @@ volatile int g_right_rpm_x10 = 0;
 
 volatile int g_speed_error = 0;
 volatile int g_position_error = 0;
-volatile int g_total_error = 0;
+
+/* Bien PD de quan sat tren SWV */
+volatile int g_pd_error = 0;
+volatile int g_pd_derivative = 0;
+volatile int g_pd_output = 0;
 
 volatile int g_sample_count = 0;
 
@@ -30,31 +34,22 @@ volatile int g_sample_count = 0;
 
 #define PWM_MIN           0
 #define PWM_MAX           999
-
-/*
-    PWM co dinh de tuning.
-    Khong quet PWM trong giai doan toi uu.
-*/
 #define PWM_BASE          500
 
 /*
-    Tham so bu PWM.
+    Bo dieu khien PD dang fixed-point.
 
-    KP_POS: sua sai so vi tri tich luy
-    KP_SPEED: sua sai so toc do tuc thoi
+    PD_SCALE = 100 nghia la:
+    PD_KP = 5    -> Kp = 0.05
+    PD_KD = 300  -> Kd = 3.00
 
-    Neu position_error van tang nhanh:
-    - tang KP_POS
-    - hoac giam POSITION_DIV
-
-    Neu PWM dao dong manh:
-    - giam KP_SPEED
-    - tang POSITION_DIV
+    Cong thuc:
+    PD_output = (PD_KP * error + PD_KD * derivative) / PD_SCALE
 */
-#define KP_POS            1
-#define POSITION_DIV      20
+#define PD_SCALE          100
 
-#define KP_SPEED          3
+#define PD_KP             5
+#define PD_KD             300
 
 #define PWM_COMP_LIMIT    300
 
@@ -76,6 +71,8 @@ volatile uint16_t right_old = 0;
 
 volatile int left_total = 0;
 volatile int right_total = 0;
+
+volatile int pd_error_old = 0;
 
 /* ================= KHAI BAO HAM ================= */
 
@@ -115,11 +112,16 @@ int main(void)
             g_pwm_left
             g_pwm_right
             g_pwm_comp
+
             g_left_delta
             g_right_delta
-            g_speed_error
+
             g_position_error
-            g_total_error
+            g_speed_error
+
+            g_pd_error
+            g_pd_derivative
+            g_pd_output
         */
     }
 }
@@ -150,6 +152,7 @@ void GPIO_Motor_Init(void)
     GPIOA->MODER |=  ((2 << 12) | (2 << 14));
 
     // PA6, PA7 = AF2 = TIM3
+    // GPIOA->AFR[0] la AFRL
     GPIOA->AFR[0] &= ~((15 << 24) | (15 << 28));
     GPIOA->AFR[0] |=  ((2 << 24) | (2 << 28));
 }
@@ -204,6 +207,7 @@ void Encoder_TIM2_Init(void)
     GPIOA->MODER |=  ((2 << 0) | (2 << 2));
 
     // PA0, PA1 = AF1 = TIM2
+    // GPIOA->AFR[0] la AFRL
     GPIOA->AFR[0] &= ~((15 << 0) | (15 << 4));
     GPIOA->AFR[0] |=  ((1 << 0) | (1 << 4));
 
@@ -243,6 +247,7 @@ void Encoder_TIM4_Init(void)
     GPIOB->MODER |=  ((2 << 12) | (2 << 14));
 
     // PB6, PB7 = AF2 = TIM4
+    // GPIOB->AFR[0] la AFRL
     GPIOB->AFR[0] &= ~((15 << 24) | (15 << 28));
     GPIOB->AFR[0] |=  ((2 << 24) | (2 << 28));
 
@@ -335,7 +340,7 @@ void TIM5_IRQHandler(void)
             g_right_delta = 0;
         }
 
-        /* ===== TINH SAI SO ===== */
+        /* ===== TINH SAI SO ENCODER ===== */
 
         left_total += g_left_delta;
         right_total += g_right_delta;
@@ -363,22 +368,42 @@ void TIM5_IRQHandler(void)
         g_left_rpm_x10 = g_left_delta * 60000 / ENCODER_PPR;
         g_right_rpm_x10 = g_right_delta * 60000 / ENCODER_PPR;
 
-        /*
-            Total error:
-            - Thanh phan position_error giup sua sai so tich luy.
-            - Thanh phan speed_error giup phan ung nhanh.
-        */
-        g_total_error = (KP_POS * (g_position_error / POSITION_DIV))
-                      + (KP_SPEED * g_speed_error);
+        /* ===== BO DIEU KHIEN PD ===== */
 
         /*
-            Gioi han bu PWM.
+            Error cua PD la sai so vi tri giua 2 banh.
+            Muc tieu: g_position_error = 0.
         */
-        g_pwm_comp = limit_value(g_total_error, -PWM_COMP_LIMIT, PWM_COMP_LIMIT);
+        g_pd_error = g_position_error;
 
         /*
-            Neu error > 0:
-            banh trai nhanh/di nhieu hon
+            Dao ham roi rac:
+            derivative = error hien tai - error cu
+
+            Vi error = left_count - right_count
+            nen derivative gan tuong duong:
+            left_delta - right_delta
+        */
+        g_pd_derivative = g_pd_error - pd_error_old;
+        pd_error_old = g_pd_error;
+
+        /*
+            PD fixed-point:
+            output = (Kp * error + Kd * derivative) / scale
+        */
+        g_pd_output = (PD_KP * g_pd_error
+                     + PD_KD * g_pd_derivative) / PD_SCALE;
+
+        /*
+            Gioi han luong PWM bu.
+        */
+        g_pwm_comp = limit_value(g_pd_output,
+                                -PWM_COMP_LIMIT,
+                                 PWM_COMP_LIMIT);
+
+        /*
+            Neu g_pwm_comp > 0:
+            banh trai nhanh hon / di nhieu hon banh phai
             => giam PWM trai, tang PWM phai.
         */
         g_pwm_left = g_pwm_base - g_pwm_comp;
@@ -434,6 +459,14 @@ void Motor_Stop(void)
 
     g_pwm_left = 0;
     g_pwm_right = 0;
+
+    /*
+        Reset bien PD khi dung motor.
+    */
+    g_pd_error = 0;
+    g_pd_derivative = 0;
+    g_pd_output = 0;
+    pd_error_old = 0;
 }
 
 /* ================= HAM GIOI HAN ================= */
